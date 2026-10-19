@@ -11,7 +11,7 @@ from sklearn.feature_selection import RFE
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import LeaveOneOut, cross_val_score
 from statsmodels.stats.outliers_influence import variance_inflation_factor
-from sklearn.pipeline import Pipeline, check_is_fitted, clone
+from sklearn.pipeline import check_is_fitted, clone
 from sklearn.base import BaseEstimator, TransformerMixin
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,7 @@ class CorrelationFilter(BaseEstimator, TransformerMixin):
             raise ValueError("Threshold must be in (0 and 1].")
         self.features_name_in_ = np.asarray(X.columns, dtype=object)
         self.n_features_in_ = X.shape[1]
-        self.validate_numeric_data(X)
+        self._validate_numeric_data(X)
 
         correlation = X.corr().abs()
         upper = correlation.where(np.triu(np.ones(correlation.shape), k=1).astype(bool))
@@ -52,7 +52,7 @@ class CorrelationFilter(BaseEstimator, TransformerMixin):
         if not self.features_to_keep_:
             raise ValueError("Correlation filtering removed all features.")
 
-        logger.info(f"Correlation filtering retained {len(self.features_to_keep_)} features. {X.shape[1]} features retained.")
+        logger.info("Correlation filtering retained %d of %d features.", len(self.features_to_keep_), X.shape[1])
         return self
 
     @staticmethod
@@ -119,8 +119,21 @@ class VIFFilter(BaseEstimator, TransformerMixin):
 
             while remaining.shape[1] > 1:
                 values = remaining.to_numpy(dtype=float)
+                # include an intercept in the auxillary regressions
+                design = np.column_stack((np.ones(values.shape[0]), values))
 
-                vif_values = np.asarray([variance_inflation_factor(values, i) for i in range(values.shape[1])])
+                vif_values = []
+
+                for i in range(remaining.shape[1]):
+                    try:
+                        vif = variance_inflation_factor(design, i + 1)  # +1 to skip intercept
+                    except (ValueError, np.linalg.LinAlgError):
+                        vif = np.inf
+                    if not np.isfinite(vif):
+                        vif = np.inf
+
+                    vif_values.append(vif)
+
 
                 vif_series = pd.Series(vif_values, index=remaining.columns, dtype=float)
 
@@ -128,7 +141,7 @@ class VIFFilter(BaseEstimator, TransformerMixin):
 
                 max_vif = vif_series.max()
 
-                if np.isfinite(max_vif) and max_vif <= self.threshold:
+                if max_vif <= self.threshold:
                     break
 
                 feature_to_remove = vif_series.idxmax()
@@ -161,7 +174,61 @@ class VIFFilter(BaseEstimator, TransformerMixin):
             check_is_fitted(self, "features_to_keep_")
             
             return np.asarray(self.features_to_keep_, dtype=object)
-         
+
+
+class FeatureFilter(BaseEstimator, TransformerMixin):
+    """
+    Optional correlation filter followed by mandatory VIF filtering.
+    """
+    def __init__(self, correlation_threshold: float = 0.40, vif_threshold: float = 5.0, use_correlation_filter: bool = True):
+        self.correlation_threshold = correlation_threshold
+        self.vif_threshold = vif_threshold
+        self.use_correlation_filter = use_correlation_filter
+
+
+    def fit(self, X: pd.DataFrame, y=None):
+
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("FeatureFilter requires a pandas DataFrame.")
+
+        self.features_name_in_ = np.asarray(X.columns, dtype=object)
+        self.n_features_in_ = X.shape[1]
+
+        if self.use_correlation_filter:
+            self.correlation_filter_ = CorrelationFilter(threshold=self.correlation_threshold)
+            X_filtered = self.correlation_filter_.fit_transform(X)
+        else:
+            X_filtered = X.copy()
+
+        self.vif_filter_ = VIFFilter(threshold=self.vif_threshold)
+        X_filtered = self.vif_filter_.fit_transform(X_filtered)
+
+        self.features_to_keep_ = X_filtered.columns.tolist()
+
+        if not self.features_to_keep_:
+            raise ValueError("Feature filtering removed all features.")
+        return self
+
+    def transform(self, X: pd.DataFrame):
+        check_is_fitted(self, "features_to_keep_")
+
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("FeatureFilter requires a pandas DataFrame.")
+
+        missing = set(self.features_to_keep_) - set(X.columns)
+        if missing:
+            raise ValueError(f"Input is missing fitted features: {missing}")
+
+        if self.use_correlation_filter:
+            X = self.correlation_filter_.transform(X)
+
+        X = self.vif_filter_.transform(X)
+
+        return X.loc[:, self.features_to_keep_].copy() 
+
+    def get_feature_names_out(self, input_features=None):
+        check_is_fitted(self, "features_to_keep_")
+        return np.asarray(self.features_to_keep_, dtype=object)
 
 def select_uncorrelated_features(X_train: pd.DataFrame, threshold: float = 0.40) -> list[str]:
     """
@@ -239,7 +306,11 @@ def selected_features_by_vif(X_train: pd.DataFrame, threshold: float = 5.0) -> l
 
     return X.columns.tolist()
 
-def selected_features_with_inner_cv(X_train: pd.DataFrame, y_train: pd.Series, estimator=None, max_features: int | None = None) -> FeatureSelectionResult:
+def selected_features_with_inner_cv(X_train: pd.DataFrame, y_train: pd.Series, 
+                                    estimator=None, max_features: int | None = None,
+                                    correlation_threshold: float = 0.40,
+                                    vif_threshold: float = 5.0,
+                                    use_correlation_filter: bool = True) -> FeatureSelectionResult:
     """
     Select the number of features using an inner cross-validation loop.
     The function receives only the training data from an outer cross-validation split.
@@ -297,22 +368,75 @@ def selected_features_with_inner_cv(X_train: pd.DataFrame, y_train: pd.Series, e
 
     mse_by_feature_count: dict[int, float] = {}
 
-    for n_features in range(1, max_features + 1):
-        pipeline = Pipeline([(
-            "rfe", RFE(estimator=clone(estimator), n_features_to_select=n_features, step=1)),("model", estimator)])
-        scores = cross_val_score(pipeline, X_train, y_train, cv=cv, scoring="neg_mean_squared_error", error_score="raise")
-        mse_by_feature_count[n_features] = float(-scores.mean())
+    min_avaiable_features = X_train.shape[1]
+
+    for inner_train_idx, _ in cv.split(X_train):
+
+        X_inner_train = X_train.iloc[inner_train_idx]
+        feature_filter = FeatureFilter(correlation_threshold=correlation_threshold, vif_threshold=vif_threshold,
+                                        use_correlation_filter=use_correlation_filter)
+
+        X_filtered = feature_filter.fit_transform(X_inner_train)
+
+        min_avaiable_features = min(min_avaiable_features, X_filtered.shape[1])
+
+    max_candidates = min(max_features, min_avaiable_features)
+
+    if max_candidates < 1:
+        raise ValueError("No feasible feature counts remain after filtering.")
+
+
+    for n_features in range(1, max_candidates + 1):
+
+        squared_errors = []
+
+        for inner_train_idx, inner_val_idx in cv.split(X_train):
+
+            X_inner_train = X_train.iloc[inner_train_idx]
+            X_inner_val = X_train.iloc[inner_val_idx]
+
+            y_inner_train = y_train.iloc[inner_train_idx]
+            y_inner_val = y_train.iloc[inner_val_idx]
+
+            # Fit all filters on the inner training data only.
+            feature_filter = FeatureFilter(correlation_threshold=correlation_threshold, vif_threshold=vif_threshold, 
+                                           use_correlation_filter=use_correlation_filter)
+
+            X_filtered_train = feature_filter.fit_transform(X_inner_train)
+            X_filtered_val = feature_filter.transform(X_inner_val)
+
+            selector = RFE(estimator=clone(estimator), n_features_to_select=n_features, step=1)
+            selector.fit(X_filtered_train, y_inner_train)
+
+            selected_columns = X_filtered_train.columns[selector.support_]
+
+            model = clone(estimator)
+            model.fit(X_filtered_train.loc[:, selected_columns], y_inner_train)
+
+            prediction = model.predict(X_filtered_val.loc[:, selected_columns])[0]
+
+            squared_errors.append((float(y_inner_val.iloc[0]) - float(prediction)) ** 2)
+
+        mse_by_feature_count[n_features] = float(np.mean(squared_errors))
 
     best_n = min(mse_by_feature_count, key=mse_by_feature_count.get)
 
-    # Fit RFE once more on the complete outer training set.
-    final_selector = RFE(estimator=clone(estimator), n_features_to_select=best_n, step=1)
-    final_selector.fit(X_train, y_train)
-    selected_features = X_train.columns[final_selector.support_].tolist()
+    # Refit filters and RFE on the complete outer training fold.
 
-    logger.info(f"Selected {best_n} features using LOOCV: inner-CV MSE = {mse_by_feature_count[best_n]:.4f}")
+    final_filter = FeatureFilter(correlation_threshold=correlation_threshold, vif_threshold=vif_threshold,
+                                 use_correlation_filter=use_correlation_filter)
 
-    return FeatureSelectionResult(features=selected_features, mse_by_feature_count=mse_by_feature_count, best_feature_count=best_n)
+    X_filtered = final_filter.fit_transform(X_train)
+
+    final_n = min(best_n, X_filtered.shape[1])
+
+    final_selector = RFE(estimator=clone(estimator), n_features_to_select=final_n, step=1)
+    final_selector.fit(X_filtered, y_train)
+    selected_features = X_filtered.columns[final_selector.support_].tolist()
+
+    logger.info(f"Selected {final_n} features using inner CV: inner-CV MSE = {mse_by_feature_count[best_n]:.4f}")
+    
+    return FeatureSelectionResult(features=selected_features, mse_by_feature_count=mse_by_feature_count, best_feature_count=len(selected_features))
 
 def correlation_matrix(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -392,27 +516,33 @@ def calculate_vif(df: pd.DataFrame) -> pd.DataFrame:
 
     return vif.sort_values("vif", ascending=False).reset_index(drop=True)
 
-def select_features(X_train: pd.DataFrame, y_train: pd.Series, correlation_threshold: float = 0.40,
-                    vif_threshold: float = 5.00,
-                    estimator = None,
-                    max_features: int | None = None, use_correlation_filter: bool = True) -> FeatureSelectionResult:
 
-    """
-    Perform the complete feature-selection workflow.
-    Feature selection is performed using training data only.
-    Select features using optional correlation filtering, mandatory VIF filtering, 
+def select_features(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    correlation_threshold: float = 0.40,
+    vif_threshold: float = 5.0,
+    estimator=None,
+    max_features: int | None = None,
+    use_correlation_filter: bool = True) -> FeatureSelectionResult:
+
+    """Select features using optional correlation filtering, mandatory VIF,
     and RFE with inner cross-validation.
-
-    The workflow is:
-        1. Correlation Filtering
-        2. VIF filtering
-        3. RFE with inner cross-validation
     """
     if not isinstance(X_train, pd.DataFrame):
         raise TypeError("X_train must be a pandas DataFrame.")
 
+    if not isinstance(y_train, pd.Series):
+        raise TypeError("y_train must be a pandas Series.")
+
     if X_train.empty or X_train.shape[1] == 0:
         raise ValueError("X_train contains no features.")
+
+    if y_train.empty:
+        raise ValueError("y_train contains no HSP parameter.")
+
+    if len(X_train) != len(y_train):
+        raise ValueError("X_train and y_train must have number of observations.")
 
     if not X_train.index.equals(y_train.index):
         raise ValueError("X_train and y_train must have the same index.")
@@ -423,42 +553,29 @@ def select_features(X_train: pd.DataFrame, y_train: pd.Series, correlation_thres
     if not 0 < vif_threshold:
         raise ValueError("vif_threshold must be greater than 0.")
 
+    if not 0 < correlation_threshold <= 1:
+        raise ValueError("correlation_threshold must be in (0, 1].")
+
     X = X_train.select_dtypes(include="number").copy()
+
     if X.empty:
         raise ValueError("No numeric features are available.")
 
-    if estimator is None:
-        estimator = LinearRegression()
+    if not np.isfinite(X.to_numpy(dtype=float)).all():
+        raise ValueError("X_train contains missing or infinite values.")
 
-    # -------------------------
-    # 1. Correlation filtering - OPTIONAL
-    # -------------------------
-    if use_correlation_filter:
-        correlation_features = select_uncorrelated_features(X, threshold=correlation_threshold)
-        X = X.loc[:, correlation_features]
+    if not np.isfinite(y_train.to_numpy(dtype=float)).all():
+        raise ValueError("y_train contains missing or infinite targets.")
 
-    if X.empty:
-        raise ValueError("Correlation filtering removed all features.")
+    result = selected_features_with_inner_cv(
+        X_train=X,
+        y_train=y_train,
+        estimator=estimator,
+        max_features=max_features,
+        correlation_threshold=correlation_threshold,
+        vif_threshold=vif_threshold,
+        use_correlation_filter=use_correlation_filter)
 
-    # -------------------------
-    # 2. VIF filtering - MANDATORY
-    # -------------------------
-
-    vif_features = selected_features_by_vif(X, threshold=vif_threshold)
-
-    if not vif_features:
-        raise ValueError("VIF filtering removed all features")
-
-    X = X.loc[:, vif_features]
-    if X.empty:
-        raise ValueError("VIF filtering removed all features.")
-
-    effective_max = (X.shape[1] if max_features is None else min(max_features, X.shape[1]))
-
-    # -------------------------
-
-    result = selected_features_with_inner_cv(X, y_train, estimator=estimator, max_features=effective_max)
-
-    logger.info(f"Feature selection completed. {len(result.features)} features selected.")
+    logger.info("Feature selection completed: %d features selected.", len(result.features))
 
     return result

@@ -50,7 +50,7 @@ def test_select_features():
     X, y = make_test_data()
 
     result = select_features(X, y, correlation_threshold=0.40, vif_threshold=5.0,
-                             max_features=3)
+                             max_features=3, use_correlation_filter=True)
 
     assert isinstance(result.features, list)
     assert len(result.features) >= 1
@@ -165,7 +165,6 @@ def test_select_features_rejects_invalid_max_features():
 
     with pytest.raises(ValueError, match="max_features must be at least 1."):
         select_features(X, y, max_features=0)
-
 
 
 def test_correlation_filter_removes_redundant_feature():
