@@ -226,69 +226,73 @@ def calculate_vif(df: pd.DataFrame) -> pd.DataFrame:
     return vif.sort_values("vif", ascending=False).reset_index(drop=True)
 
 def select_features(X_train: pd.DataFrame, y_train: pd.Series, correlation_threshold: float = 0.40,
-                    vif_threshold: float = 5.0,
+                    vif_threshold: float = 5.00,
                     estimator = None,
-                    max_features: int | None = None) -> FeatureSelectionResult:
+                    max_features: int | None = None, use_correlation_filter: bool = True) -> FeatureSelectionResult:
 
     """
     Perform the complete feature-selection workflow.
     Feature selection is performed using training data only.
+    Select features using optional correlation filtering, mandatory VIF filtering, 
+    and RFE with inner cross-validation.
 
     The workflow is:
         1. Correlation Filtering
         2. VIF filtering
         3. RFE with inner cross-validation
     """
-    if X_train.empty:
+    if not isinstance(X_train, pd.DataFrame):
+        raise TypeError("X_train must be a pandas DataFrame.")
+
+    if X_train.empty or X_train.shape[1] == 0:
         raise ValueError("X_train contains no features.")
 
-    if y_train.empty:
-        raise ValueError("y_train contains no HSP parameter.")
-
-    if len(X_train) != len(y_train):
-        raise ValueError("X_train and y_train must have number of observations.")
+    if not X_train.index.equals(y_train.index):
+        raise ValueError("X_train and y_train must have the same index.")
 
     if max_features is not None and max_features < 1:
         raise ValueError("max_features must be at least 1.")
+
+    if not 0 < vif_threshold:
+        raise ValueError("vif_threshold must be greater than 0.")
+
+    X = X_train.select_dtypes(include="number").copy()
+    if X.empty:
+        raise ValueError("No numeric features are available.")
 
     if estimator is None:
         estimator = LinearRegression()
 
     # -------------------------
-    # 1. Correlation filtering
+    # 1. Correlation filtering - OPTIONAL
     # -------------------------
-    correlation_features = select_uncorrelated_features(X_train, threshold=correlation_threshold)
+    if use_correlation_filter:
+        correlation_features = select_uncorrelated_features(X, threshold=correlation_threshold)
+        X = X.loc[:, correlation_features]
 
-    if not correlation_features:
-        raise ValueError("Correlation filtering removed all features")
-
-    X_filtered = X_train[correlation_features]
-
-    if not correlation_features:
-        raise ValueError("Correlation filtering removed all features")
+    if X.empty:
+        raise ValueError("Correlation filtering removed all features.")
 
     # -------------------------
-    # 2. VIF filtering
+    # 2. VIF filtering - MANDATORY
     # -------------------------
 
-    vif_features = selected_features_by_vif(X_filtered, threshold=vif_threshold)
+    vif_features = selected_features_by_vif(X, threshold=vif_threshold)
 
     if not vif_features:
         raise ValueError("VIF filtering removed all features")
 
-    X_filtered = X_filtered[vif_features]
+    X = X.loc[:, vif_features]
+    if X.empty:
+        raise ValueError("VIF filtering removed all features.")
 
-    # The maximum number of features must be based on the feature set that remains after filtering
-    if max_features is None:
-        effective_max_features = X_filtered.shape[1]
-    else:
-        effective_max_features = min(max_features, X_filtered.shape[1])
+    effective_max = (X.shape[1] if max_features is None else min(max_features, X.shape[1]))
 
     # -------------------------
-    # 3. RFE with inner CV
-    # -------------------------
 
-    result = selected_features_with_inner_cv(X_filtered, y_train, estimator=estimator, max_features=effective_max_features)
+    result = selected_features_with_inner_cv(X, y_train, estimator=estimator, max_features=effective_max)
+
+    logger.info(f"Feature selection completed. {len(result.features)} features selected.")
 
     return result
 
