@@ -1,9 +1,11 @@
+from sklearn.pipeline import clone
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from src.polymer_hsp.feature_selection import select_features, selected_features_by_vif, select_uncorrelated_features, \
-    calculate_vif, correlation_matrix, correlated_feature_pairs
+from polymer_hsp.feature_selection import select_features, selected_features_by_vif, select_uncorrelated_features, \
+    calculate_vif, correlation_matrix, correlated_feature_pairs, CorrelationFilter, VIFFilter
 
 
 def make_test_data():
@@ -163,4 +165,41 @@ def test_select_features_rejects_invalid_max_features():
 
     with pytest.raises(ValueError, match="max_features must be at least 1."):
         select_features(X, y, max_features=0)
+
+
+
+def test_correlation_filter_removes_redundant_feature():
+    X = pd.DataFrame({
+        "a": [1., 2., 3., 4., 5.],
+        "b": [2., 4., 6., 8., 10.],
+        "c": [5., 1., 4., 2., 3.],
+    })
+
+    selector = CorrelationFilter(threshold=0.9)
+    transformed = selector.fit_transform(X)
+
+    assert "a" in transformed.columns
+    assert "b" not in transformed.columns
+    assert "c" in transformed.columns
+
+
+def test_vif_filter_removes_constant_and_collinear_features():
+    X = pd.DataFrame({
+        "a": [1., 2., 3., 4., 5., 6.],
+        "b": [2., 4., 6., 8., 10., 12.],
+        "c": [1., 4., 2., 6., 3., 5.],
+        "constant": [1., 1., 1., 1., 1., 1.],
+    })
+
+    selector = VIFFilter(threshold=5.0)
+    transformed = selector.fit_transform(X)
+
+    assert "constant" not in transformed.columns
+    assert "a" in transformed.columns or "b" in transformed.columns
+    assert transformed.shape[1] >= 1
+
+
+def test_transformers_can_be_cloned():
+    assert clone(CorrelationFilter(threshold=0.4)).threshold == 0.4
+    assert clone(VIFFilter(threshold=5.0)).threshold == 5.0
 
