@@ -18,9 +18,9 @@ WORKBOOK_PATH = Path("data/raw/increased_MW_data_all.xlsx")
 OUTPUT_DIR = Path("outputs")
 
 SHEET_CONFIG = {
-    "DeltaD": {"target_column": "HSP", "label": "DeltaD"},
-    "DeltaP": {"target_column": "HSP", "label": "DeltaP"},
-    "DeltaH": {"target_column": "HSP", "label": "DeltaH"}}
+    "DeltaD": {"target_column": "DeltaD", "label": "DeltaD"},
+    "DeltaP": {"target_column": "DeltaP", "label": "DeltaP"},
+    "DeltaH": {"target_column": "DeltaH", "label": "DeltaH"}}
 
 RANDOM_FOREST_CONFIG = RandomForestConfig(
     correlation_threshold=0.40,
@@ -42,9 +42,7 @@ def run_experiment_for_sheet(workbook_path: Path, sheet_name: str, target_column
         raise ValueError(f"Sheet '{sheet_name}' contains no data.")
 
     if target_column not in df.columns:
-        raise ValueError(
-            f"Target column '{target_column}' not found in sheet "
-            f"'{sheet_name}'. Available columns: {df.columns.tolist()}")
+        raise ValueError(f"Target column '{target_column}' not found in sheet " f"'{sheet_name}'. Available columns: {df.columns.tolist()}")
 
     # Remove rows with missing targets; never impute the target.
     df = df.loc[df[target_column].notna()].copy()
@@ -52,11 +50,51 @@ def run_experiment_for_sheet(workbook_path: Path, sheet_name: str, target_column
     if df.empty:
         raise ValueError(f"Sheet '{sheet_name}' has no rows with a valid target.")
 
+    
+    if "filenames" not in df.columns:
+        raise ValueError(
+            f"Column 'filenames' not found in sheet '{sheet_name}'."
+        )
+
+    if target_column not in df.columns:
+        raise ValueError(
+            f"Target column '{target_column}' not found in "
+            f"sheet '{sheet_name}'."
+        )
+
+    # Preserve polymer identifiers separately from model inputs.
+    filenames = df["filenames"].copy()
+
+    # Convert the target to numeric values.
     y = pd.to_numeric(df[target_column], errors="raise")
 
-    # Use numeric descriptor columns only.
-    # Non-numeric identifiers are excluded from the model.
-    X = df.drop(columns=[target_column]).select_dtypes(include="number").copy()
+    # All columns except the identifier and target are descriptors.
+    X = df.drop(columns=["filenames", target_column]).copy()
+
+    # Require all descriptor columns to be numeric.
+    non_numeric = X.select_dtypes(exclude="number").columns.tolist()
+    if non_numeric:
+        raise ValueError(
+            f"Non-numeric descriptor columns in '{sheet_name}': "
+            f"{non_numeric}"
+        )
+
+    valid_rows = np.isfinite(y.to_numpy(dtype=float))
+    valid_rows &= np.isfinite(X.to_numpy(dtype=float)).all(axis=1)
+
+    X = X.loc[valid_rows].copy()
+    y = y.loc[valid_rows].copy()
+    filenames = filenames.loc[valid_rows].copy()
+
+    if len(X) < 3:
+        raise ValueError(
+            f"Sheet '{sheet_name}' has fewer than 3 valid observations."
+        )
+
+    if X.shape[1] == 0:
+        raise ValueError(
+            f"No descriptor columns found in '{sheet_name}'."
+        )
 
     if X.empty:
         raise ValueError(f"No numeric descriptor columns found in sheet '{sheet_name}'.")
@@ -83,7 +121,7 @@ def run_experiment_for_sheet(workbook_path: Path, sheet_name: str, target_column
     parameter_dir.mkdir(parents=True, exist_ok=True)
 
     # Save predictions and original row indices.
-    predictions = pd.DataFrame({"sample_index": result.sample_indices, "actual": result.y_true, "predicted": result.y_pred, "residual": result.y_true - result.y_pred})
+    predictions = pd.DataFrame({"filename": filenames.to_numpy(), "sample_index": result.sample_indices, "actual": result.y_true, "predicted": result.y_pred, "residual": result.y_true - result.y_pred})
     predictions.to_csv(parameter_dir / "predictions.csv", index=False)
 
     # Save metrics.

@@ -6,7 +6,7 @@ import logging
 import pandas as pd
 
 from polymer_hsp.evaluation import ExperimentResult, create_experiment_result
-from polymer_hsp.modelling import RandomForestConfig, run_random_forest_loocv,
+from polymer_hsp.modelling import RandomForestConfig, run_random_forest_loocv
 
 logger = logging.getLogger(__name__)
 

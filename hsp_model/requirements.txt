@@ -3,3 +3,4 @@ openpyxl
 scikit-learn
 statsmodels
 pytest
+matplotlib
