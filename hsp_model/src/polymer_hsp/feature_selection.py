@@ -13,6 +13,7 @@ from sklearn.model_selection import LeaveOneOut, cross_val_score
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from sklearn.pipeline import check_is_fitted, clone
 from sklearn.base import BaseEstimator, TransformerMixin
+from scipy.linalg import qr
 
 logger = logging.getLogger(__name__)
 
@@ -117,36 +118,149 @@ class VIFFilter(BaseEstimator, TransformerMixin):
             remaining = X.loc[:, keep].copy()
             removed = []
 
+            # Remove linearly dependent features before calculating VIF.
+            # Center and scale features so differences in descriptor units
+            # do not dominate the rank calculation.
+            values = remaining.to_numpy(dtype=float)
+
+            if not np.isfinite(values).all():
+                raise ValueError(
+                    "VIFFilter received NaN or infinite values. "
+                    "Clean or impute the input data before feature selection."
+                )
+
+            centered = values - values.mean(axis=0)
+            scales = centered.std(axis=0)
+
+            # Exclude columns whose standard deviation is zero or non-finite.
+            valid_scale = np.isfinite(scales) & (scales > 0)
+
+            remaining = remaining.loc[:, valid_scale].copy()
+            centered = centered[:, valid_scale]
+            scales = scales[valid_scale]
+
+            if remaining.empty:
+                raise ValueError(
+                    "No variable features remain for VIF calculation."
+                )
+
+            standardized = centered / scales
+
+            if not np.isfinite(standardized).all():
+                raise ValueError(
+                    "Standardisation produced NaN or infinite values in VIFFilter."
+                )
+
+            _, r, pivots = qr(
+                standardized,
+                mode="economic",
+                pivoting=True,
+            )
+
+            diagonal = np.abs(np.diag(r))
+            if diagonal.size:
+                tolerance = (
+                    max(standardized.shape)
+                    * np.finfo(float).eps
+                    * diagonal[0]
+                )
+                rank = int(np.sum(diagonal > tolerance))
+            else:
+                rank = 0
+
+            # Keep the independent columns in their original order.
+            independent_positions = sorted(pivots[:rank].tolist())
+            independent_columns = remaining.columns[independent_positions].tolist()
+
+            dependent_columns = [
+                col for col in remaining.columns
+                if col not in independent_columns
+            ]
+
+            removed.extend(dependent_columns)
+            remaining = remaining.loc[:, independent_columns].copy()
+
+            if remaining.empty:
+                raise ValueError(
+                    "No linearly independent features remain after rank checking."
+                )
+
+            logger.info(
+                "Rank check removed %d linearly dependent features.",
+                len(dependent_columns),
+            )
+
             while remaining.shape[1] > 1:
                 values = remaining.to_numpy(dtype=float)
-                # include an intercept in the auxillary regressions
-                design = np.column_stack((np.ones(values.shape[0]), values))
 
-                vif_values = []
+                # Standardise each feature to improve numerical conditioning.
+                means = values.mean(axis=0)
+                scales = values.std(axis=0)
 
-                for i in range(remaining.shape[1]):
-                    try:
-                        vif = variance_inflation_factor(design, i + 1)  # +1 to skip intercept
-                    except (ValueError, np.linalg.LinAlgError):
-                        vif = np.inf
-                    if not np.isfinite(vif):
-                        vif = np.inf
+                valid_scale = np.isfinite(scales) & (scales > 0)
 
-                    vif_values.append(vif)
+                if not valid_scale.all():
+                    invalid_columns = remaining.columns[~valid_scale].tolist()
+                    removed.extend(invalid_columns)
+                    remaining = remaining.loc[:, valid_scale].copy()
 
+                    if remaining.shape[1] <= 1:
+                        break
 
-                vif_series = pd.Series(vif_values, index=remaining.columns, dtype=float)
+                    continue
 
-                # Infinite VIF indicates perfect multicollinearity, remove the feature with the highest VIF
+                standardized = (values - means) / scales
+
+                # Detect linearly dependent columns.
+                _, r, pivots = qr(
+                    standardized,
+                    mode="economic",
+                    pivoting=True,
+                )
+
+                diagonal = np.abs(np.diag(r))
+                tolerance = (
+                    max(standardized.shape)
+                    * np.finfo(float).eps
+                    * diagonal[0]
+                ) if diagonal.size else 0.0
+
+                rank = int(np.sum(diagonal > tolerance))
+
+                if rank < remaining.shape[1]:
+                    independent_positions = sorted(pivots[:rank].tolist())
+                    keep_columns = remaining.columns[independent_positions].tolist()
+                    removed.extend(
+                        col for col in remaining.columns if col not in keep_columns
+                    )
+                    remaining = remaining.loc[:, keep_columns].copy()
+                    continue
+
+                # Standardised descriptors plus intercept.
+                design = np.column_stack([
+                    np.ones(standardized.shape[0]),
+                    standardized,
+                ])
+
+                vif_values = [
+                    variance_inflation_factor(design, i + 1)
+                    for i in range(standardized.shape[1])
+                ]
+
+                vif_series = pd.Series(
+                    vif_values,
+                    index=remaining.columns,
+                    dtype=float,
+                )
 
                 max_vif = vif_series.max()
 
-                if max_vif <= self.threshold:
+                if not np.isfinite(max_vif) or max_vif > self.threshold:
+                    feature_to_remove = vif_series.idxmax()
+                    removed.append(feature_to_remove)
+                    remaining = remaining.drop(columns=[feature_to_remove])
+                else:
                     break
-
-                feature_to_remove = vif_series.idxmax()
-                removed.append(feature_to_remove)
-                remaining = remaining.drop(columns=[feature_to_remove])
 
             self.features_to_keep_ = remaining.columns.tolist()
             self.features_to_remove_ = [col for col in X.columns if col not in self.features_to_keep_]
@@ -154,7 +268,11 @@ class VIFFilter(BaseEstimator, TransformerMixin):
             if not self.features_to_keep_:
                 raise ValueError("VIF filtering removed all features.")
 
-            logger.info(f"VIF filtering retained {len(self.features_to_keep_)} features. {X.shape[1]} features retained.")
+            logger.info(
+                "VIF filtering retained %d of %d input features.",
+                len(self.features_to_keep_),
+                X.shape[1],
+            )
             return self
 
         def transform(self, X: pd.DataFrame):
@@ -402,6 +520,17 @@ def selected_features_with_inner_cv(X_train: pd.DataFrame, y_train: pd.Series,
             feature_filter = FeatureFilter(correlation_threshold=correlation_threshold, vif_threshold=vif_threshold, 
                                            use_correlation_filter=use_correlation_filter)
 
+            values = X_inner_train.to_numpy(dtype=float)
+
+            if not np.isfinite(values).all():
+                bad_columns = X_inner_train.columns[
+                    ~np.isfinite(values).all(axis=0)
+                ].tolist()
+
+                raise ValueError(
+                    f"Invalid values in inner training fold. "
+                    f"Columns: {bad_columns}"
+                )
             X_filtered_train = feature_filter.fit_transform(X_inner_train)
             X_filtered_val = feature_filter.transform(X_inner_val)
 
