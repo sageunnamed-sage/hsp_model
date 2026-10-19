@@ -11,7 +11,7 @@ from sklearn.feature_selection import RFE
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import LeaveOneOut, cross_val_score
 from statsmodels.stats.outliers_influence import variance_inflation_factor
-from sklearn.pipeline import Pipeline
+from sklearn.pipeline import Pipeline, check_is_fitted, clone
 
 logger = logging.getLogger(__name__)
 
@@ -112,38 +112,66 @@ def selected_features_with_inner_cv(X_train: pd.DataFrame, y_train: pd.Series, e
     :return: FeatureSelectionResult. Selected feature names and inner-CV performance
     """
 
+    if not isinstance(X_train, pd.DataFrame):
+        raise TypeError("X_train must be a pandas DataFrame.")
+
+    if not isinstance(y_train, (pd.Series, pd.DataFrame)):
+        raise TypeError("y_train must be a pandas Series or DataFrame.")
+
+    if isinstance(y_train, pd.DataFrame) and y_train.shape[1] != 1:
+        raise ValueError("y_train must contain exactly one target column.")
+
+    if X_train.empty or X_train.shape[1] == 0:
+        raise ValueError("X_train contains no features.")
+
+    if len(X_train) != len(y_train):
+        raise ValueError("X_train and y_train must have the same number of samples.")
+
+    if not X_train.index.equals(y_train.index):
+        raise ValueError("X_train and y_train indexes must match.")
+
+    if len(X_train) < 3:
+        raise ValueError("At least 3 samples are required.")
+
+    if not all(pd.api.types.is_numeric_dtype(dtype) for dtype in X_train.dtypes):
+        raise ValueError("All features in X_train must be numeric.")
+
+    if not np.isfinite(X_train.to_numpy(dtype=float)).all():
+        raise ValueError("X_train contains non-finite values (NaN or Inf).")
+
+    y_values = np.asarray(y_train).reshape(-1)
+    if not np.isfinite(y_values.astype(float)).all():
+        raise ValueError("y_train contains non-finite values (NaN or Inf).")
+
     if estimator is None:
         estimator = LinearRegression()
-
-    if X_train.empty:
-        raise ValueError("X_train contains no features.")
 
     if max_features is None:
         max_features = X_train.shape[1]
 
-    if max_features < 1:
-        raise ValueError("max_features must be at least 1.")
+    if not isinstance(max_features, (int, np.integer)) or max_features < 1:
+        raise ValueError("max_features must be a positive integer.")
 
     max_features = min(max_features, X_train.shape[1])
 
-    inner_cv =LeaveOneOut()
+    cv =LeaveOneOut()
 
     mse_by_feature_count: dict[int, float] = {}
 
     for n_features in range(1, max_features + 1):
         pipeline = Pipeline([(
-            "feature_selection", RFE(estimator=estimator, n_features_to_select=n_features, step=1)),("model", estimator)])
-        scores = cross_val_score(pipeline, X_train, y_train, cv=inner_cv, scoring="neg_mean_squared_error")
-        mse_by_feature_count[n_features] = -scores.mean()
+            "rfe", RFE(estimator=clone(estimator), n_features_to_select=n_features, step=1)),("model", estimator)])
+        scores = cross_val_score(pipeline, X_train, y_train, cv=cv, scoring="neg_mean_squared_error", error_score="raise")
+        mse_by_feature_count[n_features] = float(-scores.mean())
 
     best_n = min(mse_by_feature_count, key=mse_by_feature_count.get)
 
     # Fit RFE once more on the complete outer training set.
-    final_selector = RFE(estimator=estimator, n_features_to_select=best_n, step=1)
+    final_selector = RFE(estimator=clone(estimator), n_features_to_select=best_n, step=1)
     final_selector.fit(X_train, y_train)
     selected_features = X_train.columns[final_selector.support_].tolist()
 
-    logger.info(f"Selected {best_n} features using inner CV")
+    logger.info(f"Selected {best_n} features using LOOCV: inner-CV MSE = {mse_by_feature_count[best_n]:.4f}")
 
     return FeatureSelectionResult(features=selected_features, mse_by_feature_count=mse_by_feature_count, best_feature_count=best_n)
 
@@ -298,5 +326,62 @@ def select_features(X_train: pd.DataFrame, y_train: pd.Series, correlation_thres
 
 
 
+############
+class CorrrelationFilter(BaseEstimator, TransformerMixin):
+    """
+    Remove redundant features using pairwise absolute correlation.
+    """
 
+    def __init__(self, threshold: float = 0.40):
+        self.threshold = threshold
 
+    def fit(self, X: pd.DataFrame, y = None):
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("CorrelationFilter requires a pandas DataFrame.")
+
+        if not 0 < self.threshold <= 1:
+            raise ValueError("Threshold must be in (0 and 1].")
+        self.features_name_in_ = np.asarray(X.columns, dtype=object)
+        self.n_features_in_ = X.shape[1]
+        self.validate_numeric_data(X)
+
+        correlation = X.corr().abs()
+        upper = correlation.where(np.triu(np.ones(correlation.shape), k=1).astype(bool))
+        self.features_to_drop_ = [column for column in upper.columns if (upper[column] > self.threshold).any()]
+        self.features_to_keep_ = [column for column in X.columns if column not in self.features_to_drop_]
+
+        if not self.features_to_keep_:
+            raise ValueError("Correlation filtering removed all features.")
+
+        logger.info(f"Correlation filtering retained {len(self.features_to_keep_)} features. {X.shape[1]} features retained.")
+        return self
+
+    @staticmethod
+    def _validate_numeric_data(X):
+
+        if X.shape[1] == 0:
+            raise ValueError("X contains no features.")
+
+        if not all(pd.api.types.is_numeric_dtype(dtype) for dtype in X.dtypes):
+            raise ValueError("All features must be numeric.")
+
+        if not np.isfinite(X.to_numpy(dtype=float)).all():
+            raise ValueError("Input contains missing or infinite values." \
+            "Handle these in a training-fitted preprocessing step.")
+
+    def transform(self, X: pd.DataFrame):
+        check_is_fitted(self, "features_to_keep_")
+
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("CorrelationFilter requires a pandas DataFrame.")
+
+        missing = set(self.features_to_keep_) - set(X.columns)
+        if missing:
+            raise ValueError(f"Input features are missing the following columns: {missing}")
+
+        return X.loc[:, self.features_to_keep_].copy()
+
+    def get_feature_names_out(self, input_features=None):
+
+        check_is_fitted(self, "features_to_keep_")
+        return np.asarray(self.features_to_keep_, dtype=object)
